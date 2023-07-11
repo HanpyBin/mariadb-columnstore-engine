@@ -1,0 +1,572 @@
+From f124ac2a54229b440f7c4a06010af210030457ce Mon Sep 17 00:00:00 2001
+From: HanpyBin <975189452@qq.com>
+Date: Mon, 26 Jun 2023 21:13:51 +0800
+Subject: [PATCH 04/15] update parse code
+
+---
+ writeengine/bulk/CMakeLists.txt        |  4 +-
+ writeengine/bulk/we_bulkload.cpp       | 50 +++++++++-----
+ writeengine/bulk/we_bulkloadbuffer.cpp | 96 ++++++++++++++++++++++++++
+ writeengine/bulk/we_bulkloadbuffer.h   |  4 ++
+ writeengine/bulk/we_tableinfo.cpp      | 38 +++++++---
+ writeengine/bulk/we_tableinfo.h        |  6 +-
+ 6 files changed, 164 insertions(+), 34 deletions(-)
+
+
+
+diff --git a/writeengine/bulk/we_bulkloadbuffer.h b/writeengine/bulk/we_bulkloadbuffer.h
+index 2abc40e635..b1f74444e4 100644
+--- a/writeengine/bulk/we_bulkloadbuffer.h
++++ b/writeengine/bulk/we_bulkloadbuffer.h
+@@ -289,6 +289,10 @@ class BulkLoadBuffer
+    */
+   int parse(ColumnInfo& columnInfo);
+ 
++  /** @brief Parse the parquet table data
++  */
++  int parseParquet(ColumnInfo& columnInfo, int current_batch_size);
++
+   /** @brief Set the delimiter used to delimit the columns within a row
+    */
+   void setColDelimiter(const char& delim)
+
+From 2840aea55ea43ba7de8b34c78e9332f02be794f2 Mon Sep 17 00:00:00 2001
+From: HanpyBin <975189452@qq.com>
+Date: Fri, 30 Jun 2023 23:00:54 +0800
+Subject: [PATCH 05/15] support int datatype to finish whole process
+
+---
+ writeengine/bulk/we_bulkload.cpp       |  56 ++--
+ writeengine/bulk/we_bulkloadbuffer.cpp |  89 -----
+ writeengine/bulk/we_bulkloadbuffer.h   |   4 -
+ writeengine/bulk/we_tableinfo.cpp      | 447 ++++++++++++++++++++++++-
+ writeengine/bulk/we_tableinfo.h        |  26 ++
+ 5 files changed, 483 insertions(+), 139 deletions(-)
+
+
+
+diff --git a/writeengine/bulk/we_bulkloadbuffer.h b/writeengine/bulk/we_bulkloadbuffer.h
+index b1f74444e4..2abc40e635 100644
+--- a/writeengine/bulk/we_bulkloadbuffer.h
++++ b/writeengine/bulk/we_bulkloadbuffer.h
+@@ -289,10 +289,6 @@ class BulkLoadBuffer
+    */
+   int parse(ColumnInfo& columnInfo);
+ 
+-  /** @brief Parse the parquet table data
+-  */
+-  int parseParquet(ColumnInfo& columnInfo, int current_batch_size);
+-
+   /** @brief Set the delimiter used to delimit the columns within a row
+    */
+   void setColDelimiter(const char& delim)
+
+
+
+From 385092e78299e2b71d5e64268fbf5946dbdf5ba6 Mon Sep 17 00:00:00 2001
+From: HanpyBin <975189452@qq.com>
+Date: Sun, 2 Jul 2023 22:33:58 +0800
+Subject: [PATCH 06/15] add support for
+ float,double,char,short,ushort,byte,ubyte
+
+---
+ utils/dataconvert/dataconvert.cpp | 110 +++++
+ utils/dataconvert/dataconvert.h   |   7 +
+ writeengine/bulk/we_tableinfo.cpp | 644 ++++++++++++++++++++++++++++++
+ writeengine/bulk/we_tableinfo.h   |   2 +
+ 4 files changed, 763 insertions(+)
+
+
+diff --git a/writeengine/dictionary/we_dctnry.cpp b/writeengine/dictionary/we_dctnry.cpp
+index 0a4f5e90b4..c2efe3b86c 100644
+--- a/writeengine/dictionary/we_dctnry.cpp
++++ b/writeengine/dictionary/we_dctnry.cpp
+@@ -745,6 +745,212 @@ int Dctnry::insertDctnry2(Signature& sig)
+   return NO_ERROR;
+ }
+ 
++
++int Dctnry::insertDctnryParquet(std::shared_ptr<arrow::Array> columnData, const int totalRow, const int col, char* tokenBuf, long long& truncCount)
++{
++  int startPos = 0;
++  int totalUseSize = 0;
++
++  bool found = false;
++  Signature curSig;
++  const char* pIn;
++  char* pOut = tokenBuf;
++  int outOffset = 0;
++  bool next = false;
++  CommBlock cb;
++  cb.file.oid = m_dctnryOID;
++  cb.file.pFile = m_dFile;
++  WriteEngine::Token nullToken;
++  auto binaryArray = std::static_pointer_cast<arrow::BinaryArray>(columnData);
++
++  while (startPos < totalRow)
++  {
++    found = false;
++    void* curSigPtr = static_cast<void*>(&curSig);
++    memset(curSigPtr, 0, sizeof(curSig));
++
++    const uint8_t* data = binaryArray->GetValue(startPos, &curSig.size);
++    const char* dataPtr = reinterpret_cast<const char*>(data);
++
++    if (curSig.size > 0)
++    {
++      const char* fld = dataPtr;
++      int kk = curSig.size - 1;
++
++      for (; kk >= 0; kk--)
++      {
++        if (fld[kk] != '\0')
++          break;
++      }
++      curSig.size = kk + 1;
++    }
++
++    if ((curSig.size == 0) || (curSig.size > MAX_BLOB_SIZE))
++    {
++      if (m_defVal.length() > 0)
++      {
++        pIn = m_defVal.c_str();
++        curSig.signature = (unsigned char*)pIn;
++        curSig.size = m_defVal.length();
++      }
++      else
++      {
++        memcpy(pOut + outOffset, &nullToken, 8);
++        outOffset += 8;
++        startPos++;
++        continue;
++      }
++    }
++    else
++    {
++      pIn = dataPtr;
++      curSig.signature = (unsigned char*)pIn;
++    }
++
++    if (curSig.size > m_colWidth)
++    {
++      uint8_t truncate_point = utf8::utf8_truncate_point((const char*)curSig.signature, m_colWidth);
++      curSig.size = m_colWidth - truncate_point;
++      ++truncCount;
++    }
++
++    if (curSig.size <= MAX_SIGNATURE_SIZE)
++    {
++      found = getTokenFromArray(curSig);
++
++      if (found)
++      {
++        memcpy(pOut + outOffset, &curSig.token, 8);
++        outOffset += 8;
++        startPos++;
++        continue;
++      }
++    }
++    totalUseSize = m_totalHdrBytes + curSig.size;
++
++    if (((totalUseSize <= m_freeSpace - HDR_UNIT_SIZE) ||
++         ((curSig.size > 8176) && (m_freeSpace > HDR_UNIT_SIZE))) &&
++         (m_curOp < (MAX_OP_COUNT - 1)))
++    {
++      RETURN_ON_ERROR(insertDctnry2(curSig));
++      m_curBlock.state = BLK_WRITE;
++      memcpy(pOut + outOffset, &curSig.token, 8);
++      outOffset += 8;
++      startPos++;
++      found = true;
++
++      if (m_curOp >= MAX_OP_COUNT - 1)
++      {
++        RETURN_ON_ERROR(writeDBFileNoVBCache(cb, &m_curBlock, m_curFbo));
++        m_curBlock.state = BLK_READ;
++        next = true;
++      }
++
++      if ((m_arraySize < MAX_STRING_CACHE_SIZE) && (curSig.size <= MAX_SIGNATURE_SIZE))
++      {
++        addToStringCache(curSig);
++      }
++    }
++    else
++    {
++      RETURN_ON_ERROR(writeDBFileNoVBCache(cb, &m_curBlock, m_curFbo));
++      m_curBlock.state = BLK_READ;
++      next = true;
++      found = false;
++    }
++
++    if (next)
++    {
++      memset(m_curBlock.data, 0, sizeof(m_curBlock.data));
++      memcpy(m_curBlock.data, &m_dctnryHeader2, m_totalHdrBytes);
++      m_freeSpace = BYTE_PER_BLOCK - m_totalHdrBytes;
++      m_curBlock.state = BLK_WRITE;
++      m_curOp = 0;
++      next = false;
++      m_lastFbo++;
++      m_curFbo = m_lastFbo;
++
++      //...Expand current extent if it is an abbreviated initial extent
++      if ((m_curFbo == m_numBlocks) && (m_numBlocks == NUM_BLOCKS_PER_INITIAL_EXTENT))
++      {
++        RETURN_ON_ERROR(expandDctnryExtent());
++      }
++
++      //...Allocate a new extent if we have reached the last block in the
++      //   current extent.
++      if (m_curFbo == m_numBlocks)
++      {
++        // last block
++        LBID_t startLbid;
++
++        // Add an extent.
++        RETURN_ON_ERROR(
++            createDctnry(m_dctnryOID, m_colWidth, m_dbRoot, m_partition, m_segment, startLbid, false));
++
++        if (m_logger)
++        {
++          std::ostringstream oss;
++          oss << "Add dictionary extent OID-" << m_dctnryOID << "; DBRoot-" << m_dbRoot << "; part-"
++              << m_partition << "; seg-" << m_segment << "; hwm-" << m_curFbo << "; LBID-" << startLbid
++              << "; file-" << m_segFileName;
++          m_logger->logMsg(oss.str(), MSGLVL_INFO2);
++        }
++int Dctnry::insertDctnryParquet(std::shared_ptr<arrow::Array> columnData, const int totalRow, const int col, char* tokenBuf, long long& truncCount)
++{
++  int startPos = 0;
++  int totalUseSize = 0;
++
++  bool found = false;
++  Signature curSig;
++  const char* pIn;
++  char* pOut = tokenBuf;
++  int outOffset = 0;
++  bool next = false;
++  CommBlock cb;
++  cb.file.oid = m_dctnryOID;
++  cb.file.pFile = m_dFile;
++  WriteEngine::Token nullToken;
++  auto binaryArray = std::static_pointer_cast<arrow::BinaryArray>(columnData);
++
++  while (startPos < totalRow)
++  {
++    found = false;
++    void* curSigPtr = static_cast<void*>(&curSig);
++    memset(curSigPtr, 0, sizeof(curSig));
++
++    const uint8_t* data = binaryArray->GetValue(startPos, &curSig.size);
++    const char* dataPtr = reinterpret_cast<const char*>(data);
++
++    if (curSig.size > 0)
++    {
++      const char* fld = dataPtr;
++      int kk = curSig.size - 1;
++
++      for (; kk >= 0; kk--)
++      {
++        if (fld[kk] != '\0')
++          break;
++      }
++      curSig.size = kk + 1;
++    }
++
++    if ((curSig.size == 0) || (curSig.size > MAX_BLOB_SIZE))
++    {
++      if (m_defVal.length() > 0)
++      {
++        pIn = m_defVal.c_str();
++        curSig.signature = (unsigned char*)pIn;
++        curSig.size = m_defVal.length();
++      }
++      else
++      {
++        memcpy(pOut + outOffset, &nullToken, 8);
++        outOffset += 8;
++        startPos++;
++        continue;
++      }
++    }
++    else
++    {
++      pIn = dataPtr;
++      curSig.signature = (unsigned char*)pIn;
++    }
++
++    if (curSig.size > m_colWidth)
++    {
++      uint8_t truncate_point = utf8::utf8_truncate_point((const char*)curSig.signature, m_colWidth);
++      curSig.size = m_colWidth - truncate_point;
++      ++truncCount;
++    }
++
++    if (curSig.size <= MAX_SIGNATURE_SIZE)
++    {
++      found = getTokenFromArray(curSig);
++
++      if (found)
++      {
++        memcpy(pOut + outOffset, &curSig.token, 8);
++        outOffset += 8;
++        startPos++;
++        continue;
++      }
++    }
++    totalUseSize = m_totalHdrBytes + curSig.size;
++
++    if (((totalUseSize <= m_freeSpace - HDR_UNIT_SIZE) ||
++         ((curSig.size > 8176) && (m_freeSpace > HDR_UNIT_SIZE))) &&
++         (m_curOp < (MAX_OP_COUNT - 1)))
++    {
++      RETURN_ON_ERROR(insertDctnry2(curSig));
++      m_curBlock.state = BLK_WRITE;
++      memcpy(pOut + outOffset, &curSig.token, 8);
++      outOffset += 8;
++      startPos++;
++      found = true;
++
++      if (m_curOp >= MAX_OP_COUNT - 1)
++      {
++        RETURN_ON_ERROR(writeDBFileNoVBCache(cb, &m_curBlock, m_curFbo));
++        m_curBlock.state = BLK_READ;
++        next = true;
++      }
++
++      if ((m_arraySize < MAX_STRING_CACHE_SIZE) && (curSig.size <= MAX_SIGNATURE_SIZE))
++      {
++        addToStringCache(curSig);
++      }
++    }
++    else
++    {
++      RETURN_ON_ERROR(writeDBFileNoVBCache(cb, &m_curBlock, m_curFbo));
++      m_curBlock.state = BLK_READ;
++      next = true;
++      found = false;
++    }
++
++    if (next)
++    {
++      memset(m_curBlock.data, 0, sizeof(m_curBlock.data));
++      memcpy(m_curBlock.data, &m_dctnryHeader2, m_totalHdrBytes);
++      m_freeSpace = BYTE_PER_BLOCK - m_totalHdrBytes;
++      m_curBlock.state = BLK_WRITE;
++      m_curOp = 0;
++      next = false;
++      m_lastFbo++;
++      m_curFbo = m_lastFbo;
++
++      //...Expand current extent if it is an abbreviated initial extent
++      if ((m_curFbo == m_numBlocks) && (m_numBlocks == NUM_BLOCKS_PER_INITIAL_EXTENT))
++      {
++        RETURN_ON_ERROR(expandDctnryExtent());
++      }
++
++      //...Allocate a new extent if we have reached the last block in the
++      //   current extent.
++      if (m_curFbo == m_numBlocks)
++      {
++        // last block
++        LBID_t startLbid;
++
++        // Add an extent.
++        RETURN_ON_ERROR(
++            
++        // now seek back to the curFbo, after adding an extent
++        // @bug5769 For uncompressed only;
++        // ChunkManager manages the file offset for the compression case
++        if (m_compressionType == 0)
++        {
++#ifdef PROFILE
++          Stats::startParseEvent(WE_STATS_PARSE_DCT_SEEK_EXTENT_BLK);
++#endif
++          long long byteOffset = m_curFbo;
++          byteOffset *= BYTE_PER_BLOCK;
++          RETURN_ON_ERROR(setFileOffset(m_dFile, byteOffset));
++#ifdef PROFILE
++          Stats::stopParseEvent(WE_STATS_PARSE_DCT_SEEK_EXTENT_BLK);
++#endif
++        }
++      }
++      else
++      {
++        // LBIDs are numbered collectively and consecutively within an
++        // extent, so within an extent we can derive the LBID by simply
++        // incrementing it rather than having to go back to BRM to look
++        // up the LBID for each FBO.
++        m_curLbid++;
++      }
++
++#ifdef PROFILE
++      Stats::startParseEvent(WE_STATS_PARSE_DCT);
++#endif
++      m_curBlock.lbid = m_curLbid;
++
++      //..."found" flag indicates whether the string was already found
++      //   "or" added to the end of the previous block.  If false, then
++      //   we need to add the string to the new block.
++      if (!found)
++      {
++        RETURN_ON_ERROR(insertDctnry2(curSig));  // m_freeSpace updated!
++        m_curBlock.state = BLK_WRITE;
++        memcpy(pOut + outOffset, &curSig.token, 8);
++        outOffset += 8;
++        startPos++;
++
++        //...Add string to cache, if we have not exceeded cache limit
++        if ((m_arraySize < MAX_STRING_CACHE_SIZE) && (curSig.size <= MAX_SIGNATURE_SIZE))
++        {
++          addToStringCache(curSig);
++        }
++      }
++    }  // if next
++  }
++
++  return NO_ERROR;
++}
++
+ /*******************************************************************************
+  * Description:
+  * Used by bulk import to insert collection of strings into this store file.
+
+
+From fb0abbf9b5d26a94b09a864fbe5b96572afd4e4c Mon Sep 17 00:00:00 2001
+From: HanpyBin <975189452@qq.com>
+Date: Sun, 9 Jul 2023 14:25:42 +0800
+Subject: [PATCH 11/15] add mysql-tests, mcsParquetGen, revise decimal parsing
+
+---
+ .../basic/r/mcs287_cpimport_parquet.result    |  41 +++
+ .../basic/t/mcs287_cpimport_parquet.test      |  36 ++
+ mysql-test/columnstore/std_data/date.parquet  | Bin 0 -> 2655 bytes
+ .../columnstore/std_data/decimal.parquet      | Bin 0 -> 610 bytes
+ .../columnstore/std_data/double.parquet       | Bin 0 -> 3282 bytes
+ mysql-test/columnstore/std_data/float.parquet | Bin 0 -> 2665 bytes
+ mysql-test/columnstore/std_data/int16.parquet | Bin 0 -> 2679 bytes
+ mysql-test/columnstore/std_data/int32.parquet | Bin 0 -> 2614 bytes
+ .../columnstore/std_data/string.parquet       | Bin 0 -> 2224 bytes
+ .../std_data/test-small-scale.parquet         | Bin 0 -> 18332 bytes
+ mysql-test/columnstore/std_data/time.parquet  | Bin 0 -> 2660 bytes
+ mysql-test/columnstore/std_data/ts.parquet    | Bin 0 -> 3365 bytes
+ tests/parquetconvert-tests.cpp                |  29 ++
+ tools/CMakeLists.txt                          |   1 +
+ tools/parquetGen/CMakeLists.txt               |   6 +
+ tools/parquetGen/main.cpp                     | 344 ++++++++++++++++++
+ utils/dataconvert/dataconvert.cpp             |  79 ++++
+ utils/dataconvert/dataconvert.h               |   2 +
+ writeengine/bulk/CMakeLists.txt               |   2 +
+ writeengine/bulk/we_tableinfo.cpp             | 126 ++++++-
+ 20 files changed, 654 insertions(+), 12 deletions(-)
+ create mode 100644 mysql-test/columnstore/basic/r/mcs287_cpimport_parquet.result
+ create mode 100644 mysql-test/columnstore/basic/t/mcs287_cpimport_parquet.test
+ create mode 100644 mysql-test/columnstore/std_data/date.parquet
+ create mode 100644 mysql-test/columnstore/std_data/decimal.parquet
+ create mode 100644 mysql-test/columnstore/std_data/double.parquet
+ create mode 100644 mysql-test/columnstore/std_data/float.parquet
+ create mode 100644 mysql-test/columnstore/std_data/int16.parquet
+ create mode 100644 mysql-test/columnstore/std_data/int32.parquet
+ create mode 100644 mysql-test/columnstore/std_data/string.parquet
+ create mode 100644 mysql-test/columnstore/std_data/test-small-scale.parquet
+ create mode 100644 mysql-test/columnstore/std_data/time.parquet
+ create mode 100644 mysql-test/columnstore/std_data/ts.parquet
+ create mode 100644 tests/parquetconvert-tests.cpp
+ create mode 100644 tools/parquetGen/CMakeLists.txt
+ create mode 100644 tools/parquetGen/main.cpp
+
+
+diff --git a/utils/dataconvert/dataconvert.cpp b/utils/dataconvert/dataconvert.cpp
+index 94672a911f..2e0026b478 100644
+--- a/utils/dataconvert/dataconvert.cpp
++++ b/utils/dataconvert/dataconvert.cpp
+@@ -515,6 +515,85 @@ void number_int_value(const string& data, cscDataType typeCode,
+   }
+ }
+ 
++void parquet_int_value(int128_t& bigllVal, int columnScale, int columnPrecision, int fScale, int fPrecision, bool* bSatVal)
++{
++  int128_t leftPart = bigllVal, rightPart;
++  for (int i = 0; i < fScale; i++)
++  {
++    // bigllVal
++    leftPart /= 10;
++  }
++  // int128_t tPart = leftPart;
++  for (int i = 0; i < fScale; i++)
++  {
++    leftPart *= 10;
++  }
++  rightPart = bigllVal - leftPart;
++
++  // apply the scale
++  if (columnScale > fScale)
++  {
++    for (int i = 0; i < columnScale - fScale; i++)
++    {
++      rightPart *= 10;
++      leftPart *= 10;
++    }
++  }
++  else
++  {
++    for (int i = 0; i < fScale - columnScale; i++)
++    {
++      leftPart /= 10;
++      rightPart /= 10;
++    }
++  }
++
++  bigllVal = leftPart + rightPart;
++  // is column.width always 16?
++  // if (LIKELY(column.width == 16))
++  // {
++  int128_t tmp;
++  utils::int128Min(tmp);
++  if (bigllVal < tmp + 2)  // + 2 for NULL and EMPTY values
++  {
++    bigllVal = tmp + 2;
++    *bSatVal = true;
++  }
++  // }
++
++  if (columnScale > 0)
++  {
++    int128_t rangeUp, rangeLow;
++    if (columnPrecision < 19)
++    {
++      rangeUp = (int128_t)columnstore_precision[columnPrecision];
++    }
++    else
++    {
++      auto precision = 
++          columnPrecision == rowgroup::MagicPrecisionForCountAgg ? datatypes::INT128MAXPRECISION : columnPrecision;
++      if (precision > datatypes::INT128MAXPRECISION || precision < 0)
++      {
++        throw QueryDataExcept("Unsupported precision " + std::to_string(precision) + " converting DECIMAL ",
++                              dataTypeErr);
++      }
++      rangeUp = datatypes::ConversionRangeMaxValue[columnPrecision - 19];
++    }
++    rangeLow = -rangeUp;
++
++    if (bigllVal > rangeUp)
++    {
++      bigllVal = rangeUp;
++      *bSatVal = true;
++    }
++    else if (bigllVal < rangeLow)
++    {
++      bigllVal = rangeLow;
++      *bSatVal = true;
++    }
++  }
++}
++
+ // Explicit template instantiation
+ template void number_int_value<int64_t>(const std::string& data, cscDataType typeCode,
+                                         const datatypes::SystemCatalog::TypeAttributesStd& ct,
+
+
+
